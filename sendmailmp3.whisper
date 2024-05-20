@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+
+import os
+import io
+import tempfile
+import shutil
+import base64
+import sys
+import email
+import subprocess
+import logging
+from email import policy
+from email.parser import BytesParser
+from email.message import EmailMessage
+from pydub import AudioSegment
+from faster_whisper import WhisperModel
+
+# Configuration
+DEBUG_MODE = False  # Set to True to enable debug output
+MODEL_SIZE = "small"
+DEVICE = "cpu"  # Use "cpu" if GPU is not available
+COMPUTE_TYPE = "int8"  # Change to "int8" if using CPU
+LOG_FILE = "/var/log/voicemail_converter.log"
+HOME_DIR = "/home/asterisk" # Usually os.path.expanduser("~") or "/home/asterisk", that's where whisper stores the model
+
+logging.basicConfig(
+    level=logging.DEBUG if DEBUG_MODE else logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_FILE, encoding='utf-8')
+    ]
+)
+
+def debug_print(*args):
+    """Print debug message if debug mode is enabled."""
+    if DEBUG_MODE:
+        message = " ".join(map(str, args))
+        logging.debug(message)
+
+def transcribe_audio(file_path):
+    os.environ["HF_HOME"] = os.path.join(HOME_DIR, ".cache/huggingface")
+    model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+    segments, info = model.transcribe(file_path, beam_size=5)
+
+    debug_print(f"Detected language '{info.language}' with probability {info.language_probability}")
+
+    transcript = " ".join(segment.text for segment in segments)
+    debug_print("Audio transcribed:", transcript)
+    return transcript
+
+def convert_voicemail():
+    # Save the current directory
+    original_directory = os.getcwd()
+
+    # Create a temporary directory and change to it
+    temp_dir = tempfile.mkdtemp()
+    os.chdir(temp_dir)
+
+    debug_print("Temporary directory created:", temp_dir)
+
+    msg = BytesParser(policy=policy.default).parsebytes(sys.stdin.buffer.read())
+
+    debug_print("Email parsed successfully")
+
+    if not msg.is_multipart() or not any(part.get_content_type() != 'text/plain' for part in msg.walk()):
+        # It's plain text email
+        new_msg = msg
+        debug_print("Plaintext: ", msg)
+    else:
+        # Process the audio attachment
+        audio_part = None
+        for part in msg.iter_attachments():
+            debug_print("Part Content Type: ", part.get_content_type());
+            if part.get_content_type() in ["audio/wav", "audio/x-wav"]:
+                audio_part = part
+                break
+
+        if audio_part is None:
+            raise ValueError("No audio/wav part found")
+
+        debug_print("Audio attachment found")
+
+        audio_data = audio_part.get_payload(decode=True)
+        with open("stream.wav", "wb") as f:
+            f.write(audio_data)
+
+        debug_print("Audio attachment saved as stream.wav for transcription.")
+
+	# Convert audio data from WAV to MP3 format
+        sound = AudioSegment.from_wav(io.BytesIO(audio_data))
+        mp3_data = sound.export(format="mp3", bitrate="24k").read()
+
+        debug_print("Audio converted to MP3 format.")
+
+        # Create the new email message
+        new_msg = EmailMessage()
+        new_msg['From'] = msg['From']
+        new_msg['To'] = msg['To']
+        new_msg['Subject'] = msg['Subject']
+
+        # Extract the original body
+        original_body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain":
+                    original_body = part.get_payload(decode=True).decode('utf-8')
+                    break
+        else:
+            original_body = msg.get_payload(decode=True).decode('utf-8')
+
+        # Transcribe the audio
+        with open("temp.wav", "wb") as f:
+            f.write(audio_data)
+        transcript = transcribe_audio("temp.wav")
+
+        # Combine original body and transcript
+        new_body = f"{original_body}\n\nTranskribierte Nachricht: \'{transcript.strip()}\'"
+        new_msg.set_content(new_body, subtype='plain', charset='utf-8')
+
+        # Attach the MP3 file
+        new_msg.add_attachment(mp3_data, maintype='audio', subtype='mpeg', filename='voicemail.mp3')
+
+        debug_print("New email message created with MP3 attachment")
+
+        # Save the new message
+        with open("stream.new.eml", "wb") as f:
+            f.write(new_msg.as_bytes(policy=email.policy.SMTPUTF8))
+
+        debug_print("New email message saved as stream.new.eml")
+
+        # Send the email using sendmail
+        with open("stream.new.eml", "rb") as f:
+            subprocess.run(["sendmail", "-t"], input=f.read())
+
+        debug_print("Email sent using sendmail")
+
+    # Clean up and go back to the original directory
+    os.chdir(original_directory)
+    shutil.rmtree(temp_dir)
+
+    debug_print("Temporary directory deleted:", temp_dir)
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    """Handle uncaught exceptions and log them."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        # Call the default handler for KeyboardInterrupt
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    logging.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+# Set the global exception handler
+sys.excepthook = handle_exception
+
+if __name__ == "__main__":
+    try:
+        debug_print("Started.")
+        convert_voicemail()
+    except Exception as e:
+        logging.error("An error occurred", exc_info=True)
+        raise  # Re-raise the exception after logging it
